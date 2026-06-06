@@ -3,6 +3,14 @@ assets/
 checkpoints/
 data/
 wandb/
+fastumi_data/
+.eval_results/
+
+# Model weights / large binaries
+*.safetensors
+*.pth
+*.ckpt
+*.bin
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

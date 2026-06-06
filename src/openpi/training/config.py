@@ -462,6 +462,54 @@ class LeRobotDROIDDataConfig(DataConfigFactory):
         )
 
 
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotUMIDataConfig(DataConfigFactory):
+    """Data config for UMI dataset in LeRobot format.
+
+    UMI actions: pos(3) + rot6d(6) + gripper(1) = 10 dims per robot (relative/delta).
+    Images: cam_high, cam_left_wrist, cam_right_wrist.
+    """
+
+    repo_id: str = ""
+    action_dim: int = 10
+    num_robots: int = 1
+    euler_input: bool = False  # True if dataset uses Euler angles, False if already 6D rotation
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        import openpi.policies.umi_policy as umi_policy
+
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "cam_high": "observation.images.cam_high",
+                        "cam_left_wrist": "observation.images.cam_left_wrist",
+                        "cam_right_wrist": "observation.images.cam_right_wrist",
+                        "observation.state": "observation.state",
+                        "action": "action",
+                        # Prompt is already set by PromptFromLeRobotTask (when prompt_from_task=True)
+                        # → pass through instead of reading dataset "task" key directly.
+                        "prompt": "prompt",
+                    }
+                )
+            ]
+        )
+        data_transforms = _transforms.Group(
+            inputs=[umi_policy.UMIInputs(euler_input=self.euler_input, num_robots=self.num_robots)],
+            outputs=[umi_policy.UMIOutputs(action_dim=self.action_dim)],
+        )
+        model_transforms = ModelTransformFactory()(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
@@ -915,6 +963,82 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
         num_train_steps=20_000,
         batch_size=32,
+    ),
+    #
+    # UMI Fine-Tuning Config
+    #
+    TrainConfig(
+        name="pi05_umi",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=10,
+            # UMI action format: pos(3) + rot6d(6) + grip(1) = 10 per robot
+            use_geodesic_loss=True,
+            num_robots=1,
+            pos_dim=3,
+            rot_dim=6,
+            grip_dim=1,
+            pos_loss_weight=1.0,
+            rot_loss_weight=1.0,  # radians; tune this!
+            grip_loss_weight=1.0,
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="your_hf_username/my_umi_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=10,
+            num_robots=1,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,  # UMI doc recommends small LR for ViT
+            decay_steps=1_000_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        save_interval=5_000,
+    ),
+    #
+    # UMI Bimanual Fine-Tuning Config
+    #
+    TrainConfig(
+        name="pi05_umi_bimanual",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,        # pi05 base checkpoint fixed dim; 20 active + 12 pad
+            action_horizon=10,
+            use_geodesic_loss=True,
+            num_robots=2,
+            pos_dim=3,
+            rot_dim=6,
+            grip_dim=1,
+            pos_loss_weight=1.0,
+            rot_loss_weight=1.0,
+            grip_loss_weight=1.0,
+            freeze_patterns=["language_model"],  # UMI strategy: freeze VLM, train ViT+Expert
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="test/bimanual_ur5e_test",
+            euler_input=False,  # data already uses 6D rotation
+            base_config=DataConfig(
+                action_sequence_keys=(),     # action already pre-chunked to (10, 20)
+                prompt_from_task=True,
+            ),
+            action_dim=20,
+            num_robots=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="~/.cache/openpi/lerobot_pi05_base",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=1_000_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        save_interval=5_000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

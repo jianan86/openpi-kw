@@ -12,11 +12,24 @@ def convert_to_uint8(img: np.ndarray) -> np.ndarray:
     return img
 
 
+def _to_hwc_uint8(img: np.ndarray) -> np.ndarray:
+    """Convert an image to HWC uint8 format (required by PIL).
+
+    Handles both CHW (channels-first, e.g. LeRobot) and HWC formats,
+    and both float32 [0,1] and uint8 [0,255] dtypes.
+    """
+    # CHW → HWC if needed (first dim is small, likely channels)
+    if img.ndim == 3 and img.shape[0] in (1, 3, 4) and img.shape[-1] not in (1, 3, 4):
+        img = np.transpose(img, (1, 2, 0))  # CHW → HWC
+    # Convert float to uint8
+    return convert_to_uint8(img)
+
+
 def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BILINEAR) -> np.ndarray:
     """Replicates tf.image.resize_with_pad for multiple images using PIL. Resizes a batch of images to a target height.
 
     Args:
-        images: A batch of images in [..., height, width, channel] format.
+        images: A batch of images in [..., height, width, channel] format. Also handles [..., channel, height, width].
         height: The target height of the image.
         width: The target width of the image.
         method: The interpolation method to use. Default is bilinear.
@@ -31,7 +44,7 @@ def resize_with_pad(images: np.ndarray, height: int, width: int, method=Image.BI
     original_shape = images.shape
 
     images = images.reshape(-1, *original_shape[-3:])
-    resized = np.stack([_resize_with_pad_pil(Image.fromarray(im), height, width, method=method) for im in images])
+    resized = np.stack([_resize_with_pad_pil(Image.fromarray(_to_hwc_uint8(im)), height, width, method=method) for im in images])
     return resized.reshape(*original_shape[:-3], *resized.shape[-3:])
 
 

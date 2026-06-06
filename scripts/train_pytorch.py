@@ -416,6 +416,18 @@ def train_loop(config: _config.TrainConfig):
         enable_gradient_checkpointing = False
         logging.info("Gradient checkpointing is not supported for this model")
 
+    # Log parameter freeze status (freeze is controlled by model config freeze_patterns)
+    if is_main:
+        frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        if frozen_params > 0:
+            logging.info(
+                f"Freeze status: {frozen_params:,} params frozen, {trainable_params:,} trainable "
+                f"(controlled by model.freeze_patterns)"
+            )
+        else:
+            logging.info(f"All {trainable_params:,} parameters are trainable")
+
     # Log initial memory usage after model creation
     if is_main and torch.cuda.is_available():
         log_memory_usage(device, 0, "after_model_creation")
@@ -438,15 +450,53 @@ def train_loop(config: _config.TrainConfig):
             static_graph=world_size >= 8,  # Enable for 8+ GPUs
         )
 
-    # Load weights from weight_loader if specified (for fine-tuning)
+    # Load pretrained weights for PyTorch training.
+    # NOTE: config.weight_loader is a JAX concept and is ignored in PyTorch mode;
+    # use --pytorch_weight_path instead.
     if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+        weight_path = os.path.expanduser(config.pytorch_weight_path)
+        logging.info(f"Loading PyTorch weights from: {weight_path}")
 
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        model_path = os.path.join(weight_path, "model.safetensors")
+        state_dict = safetensors.torch.load_file(model_path, device=str(device))
+        target = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        model_state = target.state_dict()
+
+        # Only action projection layers may legitimately differ in shape
+        # (when action_dim changes). Any other mismatch is a real error.
+        _ALLOWED_MISMATCH = {"action_in_proj", "action_out_proj"}
+
+        skipped = []
+        bad_mismatches = []
+        filtered_state = {}
+        for key, tensor in state_dict.items():
+            if key in model_state and tensor.shape != model_state[key].shape:
+                param_name = key.split(".")[-2] if len(key.split(".")) >= 2 else key
+                if param_name in _ALLOWED_MISMATCH:
+                    skipped.append(f"{key}: ckpt{tensor.shape} vs model{model_state[key].shape}")
+                    continue
+                bad_mismatches.append(f"{key}: ckpt{tensor.shape} vs model{model_state[key].shape}")
+                continue
+            filtered_state[key] = tensor
+
+        if bad_mismatches:
+            raise RuntimeError(
+                f"Unexpected shape mismatch in {len(bad_mismatches)} params. "
+                f"Only action projection layers ({_ALLOWED_MISMATCH}) may differ. "
+                f"Possibly wrong checkpoint?\n" + "\n".join(bad_mismatches)
+            )
+
+        missing, unexpected = target.load_state_dict(filtered_state, strict=False)
+        if skipped:
+            logging.warning(
+                f"Skipped {len(skipped)} action-projection params (randomly initialized): "
+                + "; ".join(skipped)
+            )
+        if missing:
+            logging.info(f"{len(missing)} params not found in checkpoint (randomly initialized)")
+        if unexpected:
+            logging.info(f"{len(unexpected)} params in checkpoint not used by model")
+        logging.info(f"Loaded PyTorch weights from {weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -525,15 +575,23 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
+            # Forward pass: returns (total_loss, pos_loss, rot_loss, grip_loss) per (B, AH)
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
+            if isinstance(losses, tuple) and len(losses) == 4:
+                total_loss_per_sample, pos_loss_per_sample, rot_loss_per_sample, grip_loss_per_sample = losses
             elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                # Fallback for non-geodesic or unexpected returns
+                total_loss_per_sample = torch.tensor(losses, device=device, dtype=torch.float32)
+                pos_loss_per_sample = total_loss_per_sample
+                rot_loss_per_sample = total_loss_per_sample
+                grip_loss_per_sample = total_loss_per_sample
+            else:
+                total_loss_per_sample = losses
+                pos_loss_per_sample = losses
+                rot_loss_per_sample = losses
+                grip_loss_per_sample = losses
 
-            loss = losses.mean()
+            loss = total_loss_per_sample.mean()
 
             # Backward pass
             loss.backward()
@@ -560,6 +618,9 @@ def train_loop(config: _config.TrainConfig):
                 infos.append(
                     {
                         "loss": loss.item(),
+                        "pos_loss": pos_loss_per_sample.mean().item(),
+                        "rot_loss": rot_loss_per_sample.mean().item(),
+                        "grip_loss": grip_loss_per_sample.mean().item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }

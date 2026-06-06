@@ -34,6 +34,28 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # UMI / 6D rotation settings
+    # When use_geodesic_loss=True, the model splits action into [pos(3), rot6d(6), grip(1)]
+    # per robot and applies geodesic loss on the rotation component.
+    use_geodesic_loss: bool = False
+    # Number of robots (1=single-arm, 2=bimanual). Action dim per robot = pos_dim + rot_dim + grip_dim.
+    num_robots: int = 1
+    # Per-robot action component dimensions
+    pos_dim: int = 3
+    rot_dim: int = 6  # 6D continuous rotation
+    grip_dim: int = 1
+    # Freeze parameter name patterns (PyTorch only). Default None = train all.
+    # UMI strategy: freeze_patterns=["language_model"] to freeze VLM while training ViT+Expert.
+    freeze_patterns: list[str] | None = None
+    # Loss weights: pos_weight * MSE(pos) + rot_weight * geodesic(rot) + grip_weight * MSE(grip)
+    pos_loss_weight: float = 1.0
+    rot_loss_weight: float = 1.0
+    grip_loss_weight: float = 1.0
+
+    @property
+    def action_dim_per_robot(self) -> int:
+        return self.pos_dim + self.rot_dim + self.grip_dim
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
@@ -46,6 +68,13 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.use_geodesic_loss:
+            expected_dim = self.num_robots * self.action_dim_per_robot
+            # Only increase action_dim — never shrink it (base checkpoint may use a larger dim).
+            if self.action_dim < expected_dim:
+                object.__setattr__(self, "action_dim", expected_dim)
+            if self.rot_dim != 6:
+                raise ValueError(f"Geodesic loss requires 6D rotation (rot_dim=6), got {self.rot_dim}")
 
     @property
     @override

@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.shared import rotation_utils
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -86,6 +87,16 @@ class PI0Pytorch(nn.Module):
         super().__init__()
         self.config = config
         self.pi05 = config.pi05
+        self.use_geodesic_loss = config.use_geodesic_loss
+
+        if self.use_geodesic_loss:
+            self.num_robots = config.num_robots
+            self.pos_dim = config.pos_dim
+            self.rot_dim = config.rot_dim
+            self.grip_dim = config.grip_dim
+            self.pos_loss_weight = config.pos_loss_weight
+            self.rot_loss_weight = config.rot_loss_weight
+            self.grip_loss_weight = config.grip_loss_weight
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
@@ -114,6 +125,22 @@ class PI0Pytorch(nn.Module):
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
+
+        # Apply freeze patterns (PyTorch) — e.g. freeze "language_model" for UMI strategy
+        if config.freeze_patterns:
+            frozen_count = 0
+            trainable_count = 0
+            for name, param in self.named_parameters():
+                should_freeze = any(pat in name for pat in config.freeze_patterns)
+                if should_freeze:
+                    param.requires_grad = False
+                    frozen_count += param.numel()
+                else:
+                    trainable_count += param.numel()
+            logging.info(
+                f"Freeze applied: {frozen_count/1e6:.0f}M params frozen ({config.freeze_patterns}), "
+                f"{trainable_count/1e6:.0f}M trainable"
+            )
 
         msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
         try:
@@ -371,7 +398,63 @@ class PI0Pytorch(nn.Module):
 
         v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        if not self.use_geodesic_loss:
+            loss = F.mse_loss(u_t, v_t, reduction="none")
+            return loss, loss, loss, loss  # return same for all components
+
+        # === Geodesic loss path (UMI / 6D rotation) ===
+        # Recover predicted clean action: action_pred = x_t - t * v_t
+        # (if v_t = u_t perfectly, action_pred = actions)
+        action_pred = x_t - time_expanded * v_t  # (B, AH, AD)
+
+        per_robot_dim = self.pos_dim + self.rot_dim + self.grip_dim
+        loss_components = []
+
+        for r in range(self.num_robots):
+            r_start = r * per_robot_dim
+            p_start = r_start
+            r6_start = r_start + self.pos_dim
+            g_start = r_start + self.pos_dim + self.rot_dim
+            g_end = r_start + per_robot_dim
+
+            # Position: MSE
+            pos_loss = F.mse_loss(
+                action_pred[..., p_start:r6_start],
+                actions[..., p_start:r6_start],
+                reduction="none",
+            ).mean(dim=-1)  # (B, AH)
+            loss_components.append(self.pos_loss_weight * pos_loss)
+
+            # Rotation: geodesic (6D -> 3x3 matrix -> angular distance)
+            rot6d_pred = action_pred[..., r6_start:g_start]
+            rot6d_gt = actions[..., r6_start:g_start]
+            R_pred = rotation_utils.rot6d_to_mat_torch(rot6d_pred)  # (B, AH, 3, 3)
+            R_gt = rotation_utils.rot6d_to_mat_torch(rot6d_gt)
+            rot_loss = rotation_utils.geodesic_loss(R_pred, R_gt, reduce=False)  # (B, AH)
+            loss_components.append(self.rot_loss_weight * rot_loss)
+
+            # Gripper: MSE
+            grip_loss = F.mse_loss(
+                action_pred[..., g_start:g_end],
+                actions[..., g_start:g_end],
+                reduction="none",
+            ).mean(dim=-1)  # (B, AH)
+            loss_components.append(self.grip_loss_weight * grip_loss)
+
+        # (B, AH) per-timestep combined loss
+        total_loss = torch.stack(loss_components, dim=-1).sum(dim=-1)
+
+        # Gather per-type losses for logging (sum across robots, mean across action_horizon)
+        pos_total = torch.zeros_like(total_loss)
+        rot_total = torch.zeros_like(total_loss)
+        grip_total = torch.zeros_like(total_loss)
+        for r in range(self.num_robots):
+            idx = r * 3  # each robot contributes pos, rot, grip in order
+            pos_total = pos_total + self.pos_loss_weight * loss_components[idx]
+            rot_total = rot_total + self.rot_loss_weight * loss_components[idx + 1]
+            grip_total = grip_total + self.grip_loss_weight * loss_components[idx + 2]
+
+        return total_loss, pos_total, rot_total, grip_total
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

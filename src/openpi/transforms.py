@@ -3,9 +3,11 @@ import dataclasses
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
 
+import numpy as np
+import torch
+
 import flax.traverse_util as traverse_util
 import jax
-import numpy as np
 from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
@@ -187,7 +189,14 @@ class ResizeImages(DataTransformFn):
     width: int
 
     def __call__(self, data: DataDict) -> DataDict:
-        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        images = {}
+        for k, v in data["image"].items():
+            if hasattr(v, "numpy"):
+                v = v.numpy()
+            elif isinstance(v, Tensor):
+                v = v.detach().cpu().numpy()
+            images[k] = image_tools.resize_with_pad(v, self.height, self.width)
+        data["image"] = images
         return data
 
 
