@@ -965,41 +965,6 @@ _CONFIGS = [
         batch_size=32,
     ),
     #
-    # UMI Fine-Tuning Config
-    #
-    TrainConfig(
-        name="pi05_umi",
-        model=pi0_config.Pi0Config(
-            pi05=True,
-            action_horizon=10,
-            # UMI action format: pos(3) + rot6d(6) + grip(1) = 10 per robot
-            use_geodesic_loss=True,
-            num_robots=1,
-            pos_dim=3,
-            rot_dim=6,
-            grip_dim=1,
-            pos_loss_weight=1.0,
-            rot_loss_weight=1.0,  # radians; tune this!
-            grip_loss_weight=1.0,
-        ),
-        data=LeRobotUMIDataConfig(
-            repo_id="your_hf_username/my_umi_dataset",
-            base_config=DataConfig(prompt_from_task=True),
-            action_dim=10,
-            num_robots=1,
-        ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=1_000,
-            peak_lr=1e-5,  # UMI doc recommends small LR for ViT
-            decay_steps=1_000_000,
-            decay_lr=1e-5,
-        ),
-        num_train_steps=30_000,
-        batch_size=32,
-        save_interval=5_000,
-    ),
-    #
     # UMI Bimanual Fine-Tuning Config
     #
     TrainConfig(
