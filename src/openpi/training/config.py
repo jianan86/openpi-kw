@@ -1006,6 +1006,47 @@ _CONFIGS = [
         save_interval=5_000,
     ),
     #
+    # UMI Bimanual Fine-Tuning Config
+    #
+    TrainConfig(
+        name="pi05_umi_bimanual_pika",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,        # pi05 base checkpoint fixed dim; 20 active + 12 pad
+            action_horizon=10,
+            use_geodesic_loss=True,
+            num_robots=2,
+            pos_dim=3,
+            rot_dim=6,
+            grip_dim=1,
+            pos_loss_weight=1.0,
+            rot_loss_weight=1.0,
+            grip_loss_weight=1.0,
+            freeze_patterns=["language_model"],  # UMI strategy: freeze VLM, train ViT+Expert
+        ),
+        data=LeRobotUMIDataConfig(
+            repo_id="local/pi-0601-dex",
+            euler_input=False,  # data already uses 6D rotation
+            base_config=DataConfig(
+                action_sequence_keys=(),     # action already pre-chunked to (10, 20)
+                prompt_from_task=True,
+            ),
+            action_dim=20,
+            num_robots=2,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        pytorch_weight_path="~/.cache/openpi/lerobot_pi05_base",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-5,
+            decay_steps=1_000_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        save_interval=5_000,
+    ),
+    #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #
     TrainConfig(

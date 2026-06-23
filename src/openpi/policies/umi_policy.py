@@ -7,27 +7,135 @@ Supports two dataset formats:
 FastUMI dataset (FastUMI_100k_lerobot) uses euler_input=True (7 dims per arm).
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation as R
 
-from openpi.models.model import ModelType
 from openpi.shared import rotation_utils
+
+if TYPE_CHECKING:
+    from openpi.models.model import ModelType
+
+
+def euler_rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
+    """Convert roll, pitch, yaw to rotation matrix as Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    rpy = np.asarray(rpy, dtype=np.float32)
+    roll = rpy[..., 0]
+    pitch = rpy[..., 1]
+    yaw = rpy[..., 2]
+
+    sr = np.sin(roll)
+    cr = np.cos(roll)
+    sp = np.sin(pitch)
+    cp = np.cos(pitch)
+    sy = np.sin(yaw)
+    cy = np.cos(yaw)
+
+    rot = np.empty(rpy.shape[:-1] + (3, 3), dtype=np.float32)
+    rot[..., 0, 0] = cy * cp
+    rot[..., 0, 1] = cy * sp * sr - sy * cr
+    rot[..., 0, 2] = cy * sp * cr + sy * sr
+    rot[..., 1, 0] = sy * cp
+    rot[..., 1, 1] = sy * sp * sr + cy * cr
+    rot[..., 1, 2] = sy * sp * cr - cy * sr
+    rot[..., 2, 0] = -sp
+    rot[..., 2, 1] = cp * sr
+    rot[..., 2, 2] = cp * cr
+    return rot
+
+
+def matrix_to_rot6d(rot_mat: np.ndarray) -> np.ndarray:
+    """Convert rotation matrix to 6D rotation using the first two columns."""
+    rot_mat = np.asarray(rot_mat, dtype=np.float32)
+    if rot_mat.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrix shape (..., 3, 3), got {rot_mat.shape}")
+    return np.concatenate([rot_mat[..., :, 0], rot_mat[..., :, 1]], axis=-1).astype(np.float32, copy=False)
+
+
+def rot6d_to_matrix(rot6d: np.ndarray) -> np.ndarray:
+    """Convert 6D rotation to rotation matrix via Gram-Schmidt."""
+    return rotation_utils.rot6d_to_mat_np(np.asarray(rot6d, dtype=np.float32)).astype(np.float32, copy=False)
+
+
+def _matrix_to_euler_rpy(rot_mat: np.ndarray) -> np.ndarray:
+    """Convert a single Rz @ Ry @ Rx rotation matrix to roll, pitch, yaw."""
+    rot_mat = np.asarray(rot_mat, dtype=np.float32)
+    if rot_mat.shape != (3, 3):
+        raise ValueError(f"Expected rotation matrix shape (3, 3), got {rot_mat.shape}")
+
+    pitch = np.arcsin(np.clip(-rot_mat[2, 0], -1.0, 1.0))
+    cos_pitch = np.cos(pitch)
+    if abs(float(cos_pitch)) > 1e-6:
+        roll = np.arctan2(rot_mat[2, 1], rot_mat[2, 2])
+        yaw = np.arctan2(rot_mat[1, 0], rot_mat[0, 0])
+    else:
+        roll = np.float32(0.0)
+        yaw = np.arctan2(-rot_mat[0, 1], rot_mat[1, 1])
+    return np.asarray([roll, pitch, yaw], dtype=np.float32)
+
+
+def pose7d_to_transform(pose7d: np.ndarray) -> np.ndarray:
+    """Convert [x, y, z, roll, pitch, yaw, gripper] to T_world_ee."""
+    pose7d = np.asarray(pose7d, dtype=np.float32)
+    if pose7d.shape != (7,):
+        raise ValueError(f"Expected pose7d shape (7,), got {pose7d.shape}")
+    transform = np.eye(4, dtype=np.float32)
+    transform[:3, :3] = euler_rpy_to_matrix(pose7d[3:6])
+    transform[:3, 3] = pose7d[:3]
+    return transform
+
+
+def transform_to_pose10d(transform: np.ndarray, gripper: float | np.float32) -> np.ndarray:
+    """Convert a 4x4 transform and gripper distance to [xyz, rot6d, gripper]."""
+    transform = np.asarray(transform, dtype=np.float32)
+    if transform.shape != (4, 4):
+        raise ValueError(f"Expected transform shape (4, 4), got {transform.shape}")
+    return np.concatenate(
+        [transform[:3, 3], matrix_to_rot6d(transform[:3, :3]), np.asarray([gripper], dtype=np.float32)],
+        axis=0,
+    ).astype(np.float32, copy=False)
+
+
+def pose7d_to_pose10d(pose7d: np.ndarray) -> np.ndarray:
+    """Convert absolute 7D pose to absolute 10D pose."""
+    pose7d = np.asarray(pose7d, dtype=np.float32)
+    return transform_to_pose10d(pose7d_to_transform(pose7d), pose7d[6])
+
+
+def relative_pose7d(target_pose7d: np.ndarray, base_pose7d: np.ndarray) -> np.ndarray:
+    """Compute target pose relative to base pose, preserving target absolute gripper distance."""
+    target_pose7d = np.asarray(target_pose7d, dtype=np.float32)
+    base_pose7d = np.asarray(base_pose7d, dtype=np.float32)
+    relative_transform = np.linalg.inv(pose7d_to_transform(base_pose7d)) @ pose7d_to_transform(target_pose7d)
+    return np.concatenate(
+        [
+            relative_transform[:3, 3],
+            _matrix_to_euler_rpy(relative_transform[:3, :3]),
+            np.asarray([target_pose7d[6]], dtype=np.float32),
+        ],
+        axis=0,
+    ).astype(np.float32, copy=False)
+
+
+def relative_pose7d_to_pose10d(target_pose7d: np.ndarray, base_pose7d: np.ndarray) -> np.ndarray:
+    """Compute relative 10D pose from target/base absolute 7D poses."""
+    relative_transform = np.linalg.inv(pose7d_to_transform(base_pose7d)) @ pose7d_to_transform(target_pose7d)
+    return transform_to_pose10d(relative_transform, np.asarray(target_pose7d, dtype=np.float32)[6])
 
 
 def euler_to_rot6d(euler_xyz: np.ndarray) -> np.ndarray:
-    """Convert Euler angles (x,y,z in radians) to 6D rotation.
+    """Convert roll, pitch, yaw angles in radians to 6D rotation.
 
     Args:
-        euler_xyz: (..., 3) array of Euler angles in XYZ convention
+        euler_xyz: (..., 3) array of roll, pitch, yaw angles
 
     Returns:
         (..., 6) array of 6D rotation representation
     """
-    mat = R.from_euler("xyz", euler_xyz).as_matrix()  # (..., 3, 3)
-    # First two columns flattened
-    rot6d = np.concatenate([mat[..., 0], mat[..., 1]], axis=-1)
-    return rot6d
+    return matrix_to_rot6d(euler_rpy_to_matrix(euler_xyz))
 
 
 class UMIInputs:
