@@ -1,0 +1,19 @@
+home_pos:
+  right_arm: [0.0, 0.44, -0.257, 0.0, 0.27, 0.0]
+  left_arm: [0.0, 0.44, -0.257, 0.0, 0.27, 0.0]
+
+camera:
+  width: 640
+  height: 480
+  fps: 30
+  image_size: 224
+
+right:
+  piper_can: right_piper
+  gripper_port: /dev/ttyUSB0
+  fisheye_device: /dev/v4l/by-path/pci-0000:c4:00.3-usb-0:1.1.1:1.0-video-index0
+
+left:
+  piper_can: left_piper
+  gripper_port: /dev/ttyUSB1
+  fisheye_device: /dev/v4l/by-path/pci-0000:c4:00.3-usb-0:1.2.1:1.0-video-index0

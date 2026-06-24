@@ -190,12 +190,14 @@ class UMIInputs:
     def __call__(self, data: dict) -> dict:
         # Map observation state
         data["state"] = data["observation.state"]
-        data["actions"] = data["action"]
+        if "action" in data:
+            data["actions"] = data["action"]
 
         # Euler → 6D conversion
         if self._euler_input:
             data["state"] = self._euler_to_6d(data["state"])
-            data["actions"] = self._euler_to_6d(data["actions"])
+            if "actions" in data:
+                data["actions"] = self._euler_to_6d(data["actions"])
 
         # Map images — read from top-level keys (post-repack) or nested observation.images
         images_out = {}
