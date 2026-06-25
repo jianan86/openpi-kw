@@ -15,8 +15,12 @@ Output schema matches the current OpenPI pi05_umi_bimanual config:
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import os
 import re
 import shutil
 from pathlib import Path
@@ -26,6 +30,7 @@ import numpy as np
 from PIL import Image
 
 from openpi.policies.umi_policy import pose7d_to_pose10d, relative_pose7d_to_pose10d
+from openpi.shared.image_tools import resize_with_pad
 
 DEFAULT_INPUT_ROOT = Path("/home/jianan/workspace/data/0616_dex")
 DEFAULT_OUTPUT_ROOT = Path("/home/jianan/workspace/data/lerobot_pika_0616_dex_v30")
@@ -33,6 +38,8 @@ DEFAULT_REPO_ID = "local/pika-0616-dex-v30"
 DEFAULT_TASK = "pika dex episode"
 DEFAULT_FPS = 30
 DEFAULT_HORIZON = 10
+DEFAULT_IMAGE_SIZE = 224
+DEFAULT_FRAME_WORKERS = min(2, os.cpu_count() or 1)
 
 POSE_DIR = Path("localization/pose/pika")
 GRIPPER_DIR = Path("gripper/encoder/pika")
@@ -160,14 +167,6 @@ def get_episode_task(episode_dir: Path, task_override: str | None) -> str:
     return DEFAULT_TASK
 
 
-def infer_image_shape(sample_image_path: Path) -> tuple[int, int, int]:
-    image = load_rgb_image(sample_image_path)
-    if image.ndim != 3 or image.shape[-1] != 3:
-        raise ValueError(f"Expected RGB image at {sample_image_path}, got shape {image.shape}")
-    height, width, channels = image.shape
-    return (channels, height, width)
-
-
 def create_features(image_shape: tuple[int, int, int], horizon: int) -> dict[str, dict[str, Any]]:
     state_names = [
         "right_pos_x", "right_pos_y", "right_pos_z",
@@ -230,7 +229,69 @@ def create_dataset(
     )
 
 
-def add_episode_to_dataset(dataset: Any, episode_dir: Path, horizon: int, task_override: str | None) -> dict[str, Any]:
+def prepare_frame(
+    files: dict[str, list[Path]],
+    right: dict[str, np.ndarray],
+    left: dict[str, np.ndarray],
+    task: str,
+    frame_idx: int,
+    horizon: int,
+    image_size: int,
+) -> dict[str, Any]:
+    state = np.concatenate([right["states"][frame_idx], left["states"][frame_idx]], axis=0).astype(np.float32)
+    left_image = np.asarray(resize_with_pad(load_rgb_image(files["left_fisheye"][frame_idx]), image_size, image_size))
+    right_image = np.asarray(resize_with_pad(load_rgb_image(files["right_fisheye"][frame_idx]), image_size, image_size))
+    return {
+        "task": task,
+        "observation.state": state,
+        "action": build_relative_action_chunk(right, left, frame_idx, horizon),
+        "observation.images.cam_high": np.zeros((image_size, image_size, 3), dtype=np.uint8),
+        "observation.images.cam_left_wrist": left_image,
+        "observation.images.cam_right_wrist": right_image,
+    }
+
+
+def iter_prepared_frames(
+    files: dict[str, list[Path]],
+    right: dict[str, np.ndarray],
+    left: dict[str, np.ndarray],
+    task: str,
+    written: int,
+    horizon: int,
+    image_size: int,
+    frame_workers: int,
+):
+    args = (files, right, left, task)
+    if frame_workers == 1:
+        for frame_idx in range(written):
+            yield prepare_frame(*args, frame_idx, horizon, image_size)
+        return
+
+    executor = ThreadPoolExecutor(max_workers=frame_workers)
+    pending: deque[Future[dict[str, Any]]] = deque()
+    next_frame_idx = 0
+    try:
+        while next_frame_idx < min(written, 2 * frame_workers):
+            pending.append(executor.submit(prepare_frame, *args, next_frame_idx, horizon, image_size))
+            next_frame_idx += 1
+
+        while pending:
+            yield pending.popleft().result()
+            if next_frame_idx < written:
+                pending.append(executor.submit(prepare_frame, *args, next_frame_idx, horizon, image_size))
+                next_frame_idx += 1
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def add_episode_to_dataset(
+    dataset: Any,
+    episode_dir: Path,
+    horizon: int,
+    task_override: str | None,
+    image_size: int,
+    frame_workers: int,
+) -> dict[str, Any]:
     files = discover_episode_files(episode_dir)
     frame_count = len(files["right_pose"])
     if frame_count <= horizon:
@@ -241,21 +302,9 @@ def add_episode_to_dataset(dataset: Any, episode_dir: Path, horizon: int, task_o
     task = get_episode_task(episode_dir, task_override)
 
     written = frame_count - horizon
-    sample_img = load_rgb_image(files["left_fisheye"][0])
-    black_img = np.zeros_like(sample_img)
-
-    for frame_idx in range(written):
-        state = np.concatenate([right["states"][frame_idx], left["states"][frame_idx]], axis=0).astype(np.float32)
-        dataset.add_frame(
-            {
-                "task": task,
-                "observation.state": state,
-                "action": build_relative_action_chunk(right, left, frame_idx, horizon),
-                "observation.images.cam_high": black_img,
-                "observation.images.cam_left_wrist": load_rgb_image(files["left_fisheye"][frame_idx]),
-                "observation.images.cam_right_wrist": load_rgb_image(files["right_fisheye"][frame_idx]),
-            }
-        )
+    frames = iter_prepared_frames(files, right, left, task, written, horizon, image_size, frame_workers)
+    for frame in frames:
+        dataset.add_frame(frame)
     dataset.save_episode()
     return {"episode": str(episode_dir), "source_frames": frame_count, "written_frames": written, "task": task}
 
@@ -289,10 +338,16 @@ def convert_dataset(
     limit_episodes: int | None,
     image_writer_processes: int,
     image_writer_threads: int,
+    image_size: int,
+    frame_workers: int,
 ) -> dict[str, Any]:
+    if image_size <= 0:
+        raise ValueError(f"image_size must be positive, got {image_size}")
+    if frame_workers <= 0:
+        raise ValueError(f"frame_workers must be positive, got {frame_workers}")
+
     episode_dirs = discover_episode_dirs(input_root, limit_episodes)
-    first_files = discover_episode_files(episode_dirs[0])
-    image_shape = infer_image_shape(first_files["left_fisheye"][0])
+    image_shape = (3, image_size, image_size)
     features = create_features(image_shape, horizon)
 
     dataset = create_dataset(
@@ -309,7 +364,9 @@ def convert_dataset(
     try:
         for idx, episode_dir in enumerate(episode_dirs, start=1):
             logging.info("Converting episode %s/%s: %s", idx, len(episode_dirs), episode_dir)
-            episode_manifests.append(add_episode_to_dataset(dataset, episode_dir, horizon, task))
+            episode_manifests.append(
+                add_episode_to_dataset(dataset, episode_dir, horizon, task, image_size, frame_workers)
+            )
         dataset.finalize()
     except Exception:
         dataset.finalize()
@@ -322,6 +379,10 @@ def convert_dataset(
         "lerobot_codebase_version": "v3.0",
         "fps": fps,
         "horizon": horizon,
+        "image_size": image_size,
+        "frame_workers": frame_workers,
+        "image_writer_processes": image_writer_processes,
+        "image_writer_threads": image_writer_threads,
         "total_episodes": len(episode_manifests),
         "total_written_frames": sum(ep["written_frames"] for ep in episode_manifests),
         "features": features,
@@ -342,6 +403,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--task", help="Optional task text override for every episode.")
     parser.add_argument("--overwrite", action="store_true", help="Replace an existing output dataset root.")
     parser.add_argument("--limit-episodes", type=int, help="Convert only the first N episodes for testing.")
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE)
+    parser.add_argument("--frame-workers", type=int, default=DEFAULT_FRAME_WORKERS)
     parser.add_argument("--image-writer-processes", type=int, default=0)
     parser.add_argument("--image-writer-threads", type=int, default=4)
     return parser
@@ -361,6 +424,8 @@ def main() -> None:
         limit_episodes=args.limit_episodes,
         image_writer_processes=args.image_writer_processes,
         image_writer_threads=args.image_writer_threads,
+        image_size=args.image_size,
+        frame_workers=args.frame_workers,
     )
     print(json.dumps(manifest, indent=2))
 
