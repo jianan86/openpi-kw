@@ -5,6 +5,8 @@ from __future__ import annotations
 import socket
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from typing import Dict, Optional, Tuple
 
 import numpy as np
@@ -149,6 +151,25 @@ def relative_actions_to_absolute_tcp(actions: np.ndarray, state: np.ndarray) -> 
     return np.concatenate(arm_chunks, axis=1).astype(np.float32, copy=False)
 
 
+
+def accelerate_gripper_closure(actions: np.ndarray) -> tuple[np.ndarray, list[float]]:
+    """Accelerate closing grippers while preserving the OpenPI gripper scale."""
+    actions = np.asarray(actions, dtype=np.float32)
+    if actions.ndim != 2 or actions.shape[1] != 14:
+        raise ValueError(f"expected absolute TCP action shape (T, 14), got {actions.shape}")
+
+    result = actions.copy()
+    closure_offsets = []
+    for grip_col in (RIGHT_ARM_SLICE.stop - 1, LEFT_ARM_SLICE.stop - 1):
+        offset = 0.0
+        if result[0, grip_col] > result[-1, grip_col]:
+            closure_delta = float(result[0, grip_col] - result[-1, grip_col])
+            offset = max(closure_delta * 0.2, 0.010)
+            result[:, grip_col] -= offset
+        closure_offsets.append(offset)
+    return result, closure_offsets
+
+
 def preprocess_fisheye(image: np.ndarray, size: int = 224) -> np.ndarray:
     image = np.asarray(image)
     if image.ndim != 3 or image.shape[2] != 3:
@@ -187,11 +208,28 @@ class RelativeActionPolicy(_base_policy.BasePolicy):
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
         state = np.asarray(obs["observation.state"], dtype=np.float32).copy()
-        result = self._policy.infer(obs)
+        ee_pose = np.asarray(obs["_debug.ee_pose"], dtype=np.float32)
+        tcp_pose = np.asarray(obs["_debug.tcp_pose"], dtype=np.float32)
+        print(f"[request] ee_pose={ee_pose.round(6).tolist()}", flush=True)
+        print(f"[request] tcp_pose={tcp_pose.round(6).tolist()}", flush=True)
+        request_obs = {key: value for key, value in obs.items() if not key.startswith("_debug.")}
+        result = self._policy.infer(request_obs)
         actions = np.asarray(result["actions"], dtype=np.float32)
         if self._action_horizon is not None and actions.shape[0] != self._action_horizon:
             raise ValueError(f"expected action horizon {self._action_horizon}, got {actions.shape}")
-        result["actions"] = relative_actions_to_absolute_tcp(actions, state)
+        absolute_tcp = relative_actions_to_absolute_tcp(actions, state)
+        absolute_tcp, closure_offsets = accelerate_gripper_closure(absolute_tcp)
+        if any(closure_offsets):
+            print(
+                f"[gripper] closure acceleration right={closure_offsets[0]:.6f}m "
+                f"left={closure_offsets[1]:.6f}m",
+                flush=True,
+            )
+        absolute_ee = np.stack([np.concatenate([tcp_pose7_to_ee_pose7(row[RIGHT_ARM_SLICE]), tcp_pose7_to_ee_pose7(row[LEFT_ARM_SLICE])]) for row in absolute_tcp])
+        print(f"[response] relative_action_chunk={actions.round(6).tolist()}", flush=True)
+        print(f"[response] absolute_tcp_chunk={absolute_tcp.round(6).tolist()}", flush=True)
+        print(f"[response] absolute_ee_chunk={absolute_ee.round(6).tolist()}", flush=True)
+        result["actions"] = absolute_tcp
         return result
 
     @override
@@ -263,17 +301,19 @@ def find_free_port() -> int:
 
 def _wait_for_local_port(port: int, timeout: float) -> None:
     deadline = time.time() + timeout
+    url = f"http://127.0.0.1:{port}/healthz"
     last_error = None
     while time.time() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(0.2)
-            try:
-                sock.connect(("127.0.0.1", port))
-                return
-            except OSError as error:
-                last_error = error
+        try:
+            with urllib.request.urlopen(url, timeout=0.2) as response:
+                response.read()
+                if response.status == 200:
+                    return
+                last_error = RuntimeError(f"health check returned HTTP {response.status}")
+        except (OSError, urllib.error.URLError) as error:
+            last_error = error
         time.sleep(0.05)
-    raise RuntimeError(f"ssh tunnel local port 127.0.0.1:{port} is not ready: {last_error}")
+    raise RuntimeError(f"ssh tunnel health check {url} is not ready: {last_error}")
 
 
 def _normalize(vector: np.ndarray) -> np.ndarray:

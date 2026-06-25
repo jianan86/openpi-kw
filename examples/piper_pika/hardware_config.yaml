@@ -9,11 +9,11 @@ camera:
   image_size: 224
 
 right:
-  piper_can: right_piper
+  piper_can: can0
   gripper_port: /dev/ttyUSB0
   fisheye_device: /dev/v4l/by-path/pci-0000:c4:00.3-usb-0:1.1.1:1.0-video-index0
 
 left:
-  piper_can: left_piper
+  piper_can: can1
   gripper_port: /dev/ttyUSB1
   fisheye_device: /dev/v4l/by-path/pci-0000:c4:00.3-usb-0:1.2.1:1.0-video-index0

@@ -1,6 +1,7 @@
 import logging
 import os
 import pathlib
+import time
 from typing import Any
 
 import jax.numpy as jnp
@@ -43,19 +44,26 @@ def create_trained_policy(
         presence of "model.safensors" in the checkpoint directory.
     """
     repack_transforms = repack_transforms or transforms.Group()
+    total_start = time.monotonic()
+    checkpoint_start = time.monotonic()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
+    logging.info("Checkpoint path resolution took %.2fs", time.monotonic() - checkpoint_start)
 
     # Check if this is a PyTorch model by looking for model.safetensors
     weight_path = os.path.join(checkpoint_dir, "model.safetensors")
     is_pytorch = os.path.exists(weight_path)
 
     logging.info("Loading model...")
+    model_start = time.monotonic()
     if is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+    logging.info("Model construction, weight load, and BF16 conversion took %.2fs", time.monotonic() - model_start)
+    data_start = time.monotonic()
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    logging.info("Data transform configuration took %.2fs", time.monotonic() - data_start)
     if norm_stats is None:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
@@ -72,7 +80,8 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
-    return _policy.Policy(
+    policy_start = time.monotonic()
+    policy = _policy.Policy(
         model,
         transforms=[
             *repack_transforms.inputs,
@@ -92,3 +101,6 @@ def create_trained_policy(
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
     )
+    logging.info("Policy device placement took %.2fs", time.monotonic() - policy_start)
+    logging.info("Policy initialization completed in %.2fs", time.monotonic() - total_start)
+    return policy

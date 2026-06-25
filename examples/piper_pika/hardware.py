@@ -27,6 +27,7 @@ _PIPER_FATAL_STATUS_TERMS = (
 class SensorSnapshot:
     left_rgb: np.ndarray
     right_rgb: np.ndarray
+    ee_pose: np.ndarray
     tcp_pose: np.ndarray
     timestamp: float
 
@@ -69,6 +70,12 @@ class PiperRobot:
         rpy = np.deg2rad(np.asarray([pose.RX_axis, pose.RY_axis, pose.RZ_axis], dtype=np.float32) / 1000.0)
         return np.concatenate([xyz, rpy]).astype(np.float32, copy=False)
 
+    def close(self) -> None:
+        if self.robot is None:
+            return
+        self.robot.DisconnectPort()
+        self.robot = None
+
     def execute_pose(self, target: np.ndarray) -> None:
         if self.robot is None or self.dry_run:
             return
@@ -102,6 +109,12 @@ class PiperRobot:
                 snapshots.append(str(method()))
         text = json.dumps(snapshots)
         errors = [term for term in _PIPER_FATAL_STATUS_TERMS if term in text]
+        if "TARGET_POS_EXCEEDS_LIMIT" in errors:
+            print(
+                f"[piper-error] Piper {self.side} reported TARGET_POS_EXCEEDS_LIMIT; continuing",
+                flush=True,
+            )
+            errors = [error for error in errors if error != "TARGET_POS_EXCEEDS_LIMIT"]
         if errors:
             raise RuntimeError(f"Piper {self.side} reported fatal status: {errors}")
 
@@ -202,12 +215,15 @@ class PiperPikaHardware:
                 width,
                 height,
                 fps,
-                dry_run,
-                no_pika,
+                dry_run=dry_run,
+                disabled=no_pika,
             )
 
     def close(self) -> None:
+        self.right_arm.close()
         self.right_gripper.close()
+        if self.left_arm is not None:
+            self.left_arm.close()
         if self.left_gripper is not None:
             self.left_gripper.close()
 
@@ -217,20 +233,24 @@ class PiperPikaHardware:
             assert self.left_arm is not None
             self.left_arm.execute_joints(np.asarray(home["left_arm"], dtype=np.float32))
 
-    def read_tcp_pose(self) -> np.ndarray:
+    def read_poses(self) -> tuple[np.ndarray, np.ndarray]:
         right_ee = np.concatenate(
             [self.right_arm.read_ee_pose(), np.asarray([self.right_gripper.read_width()], dtype=np.float32)]
         )
         right_tcp = piper_pika.ee_pose7_to_tcp_pose7(right_ee)
         if self.arm_mode == "single":
-            return np.concatenate([right_tcp, right_tcp]).astype(np.float32, copy=False)
+            ee_pose = np.concatenate([right_ee, right_ee]).astype(np.float32, copy=False)
+            tcp_pose = np.concatenate([right_tcp, right_tcp]).astype(np.float32, copy=False)
+            return ee_pose, tcp_pose
         assert self.left_arm is not None
         assert self.left_gripper is not None
         left_ee = np.concatenate(
             [self.left_arm.read_ee_pose(), np.asarray([self.left_gripper.read_width()], dtype=np.float32)]
         )
         left_tcp = piper_pika.ee_pose7_to_tcp_pose7(left_ee)
-        return np.concatenate([right_tcp, left_tcp]).astype(np.float32, copy=False)
+        ee_pose = np.concatenate([right_ee, left_ee]).astype(np.float32, copy=False)
+        tcp_pose = np.concatenate([right_tcp, left_tcp]).astype(np.float32, copy=False)
+        return ee_pose, tcp_pose
 
     def read_snapshot(self) -> SensorSnapshot:
         right = piper_pika.preprocess_fisheye(self.right_gripper.read_rgb(), self.image_size)
@@ -239,18 +259,29 @@ class PiperPikaHardware:
         else:
             assert self.left_gripper is not None
             left = piper_pika.preprocess_fisheye(self.left_gripper.read_rgb(), self.image_size)
-        return SensorSnapshot(left_rgb=left, right_rgb=right, tcp_pose=self.read_tcp_pose(), timestamp=time.time())
+        ee_pose, tcp_pose = self.read_poses()
+        return SensorSnapshot(
+            left_rgb=left,
+            right_rgb=right,
+            ee_pose=ee_pose,
+            tcp_pose=tcp_pose,
+            timestamp=time.time(),
+        )
 
     def execute(self, tcp_target: np.ndarray) -> None:
         right = tcp_target[piper_pika.RIGHT_ARM_SLICE]
-        self.right_arm.execute_pose(piper_pika.tcp_pose7_to_ee_pose7(right))
+        right_ee = piper_pika.tcp_pose7_to_ee_pose7(right)
+        print(f"[control] right tcp={right.round(6).tolist()} ee={right_ee.round(6).tolist()}", flush=True)
+        self.right_arm.execute_pose(right_ee)
         self.right_gripper.execute_width(float(right[6]))
         if self.arm_mode == "single":
             return
         assert self.left_arm is not None
         assert self.left_gripper is not None
         left = tcp_target[piper_pika.LEFT_ARM_SLICE]
-        self.left_arm.execute_pose(piper_pika.tcp_pose7_to_ee_pose7(left))
+        left_ee = piper_pika.tcp_pose7_to_ee_pose7(left)
+        print(f"[control] left tcp={left.round(6).tolist()} ee={left_ee.round(6).tolist()}", flush=True)
+        self.left_arm.execute_pose(left_ee)
         self.left_gripper.execute_width(float(left[6]))
 
 

@@ -48,6 +48,9 @@ class Args:
 
     # Port to serve the policy on.
     port: int = 8000
+
+    # PyTorch compile mode for inference. Use "none" to avoid first-request compilation.
+    pytorch_compile_mode: str = "none"
     # Record the policy's behavior for debugging.
     record: bool = False
 
@@ -76,11 +79,32 @@ DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
 }
 
 
-def create_default_policy(env: EnvMode, *, default_prompt: str | None = None) -> _policy.Policy:
+def _get_train_config(config_name: str, compile_mode: str) -> _config.TrainConfig:
+    supported = {
+        "none",
+        "default",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    }
+    if compile_mode not in supported:
+        raise ValueError(f"Unsupported PyTorch compile mode: {compile_mode}. Expected one of {sorted(supported)}")
+    train_config = _config.get_config(config_name)
+    resolved_mode = None if compile_mode == "none" else compile_mode
+    model_config = dataclasses.replace(train_config.model, pytorch_compile_mode=resolved_mode)
+    logging.info("PyTorch compile mode: %s", compile_mode)
+    return dataclasses.replace(train_config, model=model_config)
+
+
+def create_default_policy(
+    env: EnvMode, *, default_prompt: str | None = None, pytorch_compile_mode: str = "none"
+) -> _policy.Policy:
     """Create a default policy for the given environment."""
     if checkpoint := DEFAULT_CHECKPOINT.get(env):
         return _policy_config.create_trained_policy(
-            _config.get_config(checkpoint.config), checkpoint.dir, default_prompt=default_prompt
+            _get_train_config(checkpoint.config, pytorch_compile_mode),
+            checkpoint.dir,
+            default_prompt=default_prompt,
         )
     raise ValueError(f"Unsupported environment mode: {env}")
 
@@ -90,10 +114,16 @@ def create_policy(args: Args) -> _policy.Policy:
     match args.policy:
         case Checkpoint():
             return _policy_config.create_trained_policy(
-                _config.get_config(args.policy.config), args.policy.dir, default_prompt=args.default_prompt
+                _get_train_config(args.policy.config, args.pytorch_compile_mode),
+                args.policy.dir,
+                default_prompt=args.default_prompt,
             )
         case Default():
-            return create_default_policy(args.env, default_prompt=args.default_prompt)
+            return create_default_policy(
+                args.env,
+                default_prompt=args.default_prompt,
+                pytorch_compile_mode=args.pytorch_compile_mode,
+            )
 
 
 def main(args: Args) -> None:

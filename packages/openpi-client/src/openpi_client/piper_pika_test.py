@@ -40,3 +40,38 @@ def test_limit_pose_step_uses_shortest_rotation_delta():
     np.testing.assert_allclose(limited[3:5], [0.2, -0.2], atol=1e-6)
     np.testing.assert_allclose(limited[5] - current[5], 0.02, atol=1e-5)
     np.testing.assert_allclose(limited[6], 0.06, atol=1e-6)
+
+
+def test_accelerate_gripper_closure():
+    actions = np.zeros((3, 14), dtype=np.float32)
+    actions[:, 6] = [0.08, 0.075, 0.07]
+    actions[:, 13] = [0.04, 0.05, 0.06]
+    original = actions.copy()
+
+    result, offsets = piper_pika.accelerate_gripper_closure(actions)
+
+    np.testing.assert_allclose(result[:, 6], original[:, 6] - 0.01)
+    np.testing.assert_allclose(result[:, 13], original[:, 13])
+    np.testing.assert_allclose(actions, original)
+    np.testing.assert_allclose(offsets, [0.01, 0.0])
+
+
+def test_accelerate_gripper_closure_uses_proportional_offset():
+    actions = np.zeros((2, 14), dtype=np.float32)
+    actions[:, 6] = [0.09, 0.01]
+    actions[:, 13] = [0.08, 0.02]
+
+    result, offsets = piper_pika.accelerate_gripper_closure(actions)
+
+    np.testing.assert_allclose(offsets, [0.016, 0.012])
+    np.testing.assert_allclose(result[:, 6], actions[:, 6] - 0.016)
+    np.testing.assert_allclose(result[:, 13], actions[:, 13] - 0.012)
+
+
+def test_accelerate_gripper_closure_rejects_wrong_shape():
+    try:
+        piper_pika.accelerate_gripper_closure(np.zeros((2, 20), dtype=np.float32))
+    except ValueError as error:
+        assert "(T, 14)" in str(error)
+    else:
+        raise AssertionError("expected ValueError")

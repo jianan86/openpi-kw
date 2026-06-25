@@ -60,6 +60,8 @@ class PiperPikaEnvironment(_environment.Environment):
             "cam_left_wrist": snapshot.left_rgb,
             "cam_right_wrist": snapshot.right_rgb,
             "prompt": self._prompt,
+            "_debug.ee_pose": snapshot.ee_pose.copy(),
+            "_debug.tcp_pose": snapshot.tcp_pose.copy(),
         }
 
     @override
@@ -80,7 +82,8 @@ class PiperPikaEnvironment(_environment.Environment):
                 self._gripper_range,
             )
         if self._dry_run:
-            print(f"[dry-run] target={limited.round(5).tolist()}")
+            ee = np.concatenate([piper_pika.tcp_pose7_to_ee_pose7(limited[piper_pika.RIGHT_ARM_SLICE]), piper_pika.tcp_pose7_to_ee_pose7(limited[piper_pika.LEFT_ARM_SLICE])])
+            print(f"[dry-run control] tcp={limited.round(6).tolist()} ee={ee.round(6).tolist()}", flush=True)
         else:
             self._hardware.execute(limited)
         self._last_target = limited

@@ -193,7 +193,7 @@ class ResizeImages(DataTransformFn):
         for k, v in data["image"].items():
             if hasattr(v, "numpy"):
                 v = v.numpy()
-            elif isinstance(v, Tensor):
+            elif isinstance(v, torch.Tensor):
                 v = v.detach().cpu().numpy()
             images[k] = image_tools.resize_with_pad(v, self.height, self.width)
         data["image"] = images
