@@ -11,8 +11,22 @@ from scripts import convert_pika_to_lerobot as converter
 def _arm_series(frame_count: int) -> dict[str, np.ndarray]:
     poses7d = np.zeros((frame_count, 7), dtype=np.float32)
     poses7d[:, 0] = np.arange(frame_count, dtype=np.float32)
-    states = np.tile(np.arange(10, dtype=np.float32), (frame_count, 1))
-    return {"poses7d": poses7d, "states": states}
+    return {"poses7d": poses7d}
+
+
+def test_relative_state_is_previous_pose_in_current_frame() -> None:
+    previous = np.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2], dtype=np.float32)
+    current = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, np.pi / 2, 0.8], dtype=np.float32)
+    arm = {"poses7d": np.stack([previous, current])}
+
+    state = converter.build_relative_state(arm, arm, 1)
+    expected_arm = np.asarray(
+        [0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.2],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_allclose(state[:10], expected_arm, atol=1e-6)
+    np.testing.assert_allclose(state[10:], expected_arm, atol=1e-6)
 
 
 def test_prepare_frame_resizes_with_black_padding(tmp_path: Path) -> None:
@@ -22,8 +36,8 @@ def test_prepare_frame_resizes_with_black_padding(tmp_path: Path) -> None:
     Image.fromarray(image).save(left_path)
     Image.fromarray(image).save(right_path)
 
-    files = {"left_fisheye": [left_path], "right_fisheye": [right_path]}
-    frame = converter.prepare_frame(files, _arm_series(2), _arm_series(2), "task", 0, 1, 6)
+    files = {"left_fisheye": [left_path] * 3, "right_fisheye": [right_path] * 3}
+    frame = converter.prepare_frame(files, _arm_series(3), _arm_series(3), "task", 1, 1, 6)
 
     for key in (
         "observation.images.cam_high",
@@ -48,11 +62,11 @@ def test_serial_and_parallel_frames_are_equal_and_ordered(tmp_path: Path) -> Non
     right = _arm_series(6)
     left = _arm_series(6)
 
-    serial = list(converter.iter_prepared_frames(files, right, left, "task", 5, 1, 6, 1))
-    parallel = list(converter.iter_prepared_frames(files, right, left, "task", 5, 1, 6, 3))
+    serial = list(converter.iter_prepared_frames(files, right, left, "task", 4, 1, 6, 1))
+    parallel = list(converter.iter_prepared_frames(files, right, left, "task", 4, 1, 6, 3))
 
-    assert len(serial) == len(parallel) == 5
-    for frame_idx, (serial_frame, parallel_frame) in enumerate(zip(serial, parallel, strict=True)):
+    assert len(serial) == len(parallel) == 4
+    for frame_idx, (serial_frame, parallel_frame) in enumerate(zip(serial, parallel, strict=True), start=1):
         assert serial_frame.keys() == parallel_frame.keys()
         for key in serial_frame:
             if isinstance(serial_frame[key], np.ndarray):
@@ -72,7 +86,6 @@ def test_parallel_frame_order_and_exception_propagation(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(converter, "prepare_frame", prepare_in_reverse_completion_order)
     iterator = converter.iter_prepared_frames({}, {}, {}, "task", 5, 1, 6, 3)
-    assert next(iterator) == {"frame_idx": 0}
     assert next(iterator) == {"frame_idx": 1}
     assert next(iterator) == {"frame_idx": 2}
     with pytest.raises(RuntimeError, match="bad frame"):

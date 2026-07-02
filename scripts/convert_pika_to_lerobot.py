@@ -1,15 +1,56 @@
 #!/usr/bin/env python3
 """Convert Pika dual-arm episodes to an OpenPI-compatible LeRobot v3.0 dataset.
 
-Input layout is the Pika/UMI directory format used by 0616_dex:
-  episode*/localization/pose/pika_{r,l}/sync.txt
-  episode*/gripper/encoder/pika_{r,l}/sync.txt
-  episode*/camera/color/pikaFisheyeCamera_{r,l}/sync.txt
+Input
+-----
+``--input-root`` contains one directory per episode. Each modality directory has
+a ``sync.txt`` whose lines name timestamped data files in frame order::
 
-Output schema matches the current OpenPI pi05_umi_bimanual config:
-  observation.state: (20,)    [right(10), left(10)]
-  action:            (10, 20) future relative pose chunk
-  three RGB cameras: cam_high, cam_left_wrist, cam_right_wrist
+  episode*/
+    localization/pose/pika_{r,l}/          # JSON: x, y, z, roll, pitch, yaw
+    gripper/encoder/pika_{r,l}/            # JSON: distance
+    camera/color/pikaFisheyeCamera_{r,l}/  # RGB images
+    instructions.json                      # optional task text
+
+All six synchronized modality lists must have the same number of frames.
+
+Output
+------
+``--output-root`` is a local LeRobot v3.0 dataset (30 FPS by default) with one
+output episode per input episode. For a source frame ``t``:
+
+* ``observation.state`` has shape ``(20,)`` and stores right then left arm.
+  Each arm is ``xyz(3) + rot6d(6) + gripper(1)`` for the previous pose relative
+  to the current pose: ``inv(T_t) @ T_{t-1}``. The relative transform is
+  computed as a 4x4 matrix before conversion to xyz and rotation 6D; gripper is
+  the absolute value at ``t-1``.
+* ``action`` has shape ``(horizon, 20)``. Step ``k`` stores
+  ``inv(T_t) @ T_{t+k}`` for both arms, with the absolute gripper at ``t+k``.
+* ``cam_left_wrist`` and ``cam_right_wrist`` are resized with padding to
+  ``image-size`` square RGB images. ``cam_high`` is an all-black placeholder.
+* ``task`` comes from ``instructions.json``, then falls back to
+  ``"pika dex episode"`` unless ``--task`` overrides every episode.
+
+Frame 0 is skipped because it has no previous frame. The last ``horizon`` source
+frames are skipped because they lack a complete future action chunk, so an
+N-frame input episode produces ``N - horizon - 1`` output frames. A
+``conversion_manifest.json`` summary is also written under ``--output-root``.
+
+Main parameters
+---------------
+* ``--input-root`` / ``--output-root``: source and destination directories.
+* ``--repo-id``: LeRobot dataset identifier (default: local/pika-0616-dex-v30).
+* ``--horizon``: number of future action steps (default: 10).
+* ``--fps``: dataset frame rate metadata (default: 30).
+* ``--image-size``: padded square image size (default: 224).
+* ``--task``: optional task text applied to every episode.
+* ``--limit-episodes``: convert only the first N episodes for testing.
+* ``--overwrite``: delete and replace an existing output root.
+* ``--frame-workers`` and image-writer options: conversion parallelism.
+
+Example
+-------
+  python scripts/convert_pika_to_lerobot.py --limit-episodes 1 --overwrite
 """
 
 from __future__ import annotations
@@ -29,7 +70,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from openpi.policies.umi_policy import pose7d_to_pose10d, relative_pose7d_to_pose10d
+from openpi.policies.umi_policy import relative_pose7d_to_pose10d
 from openpi.shared.image_tools import resize_with_pad
 
 DEFAULT_INPUT_ROOT = Path("/home/jianan/workspace/data/0616_dex")
@@ -114,9 +155,20 @@ def build_arm_series(pose_files: list[Path], gripper_files: list[Path]) -> dict[
         gripper = load_gripper_distance(gripper_path)
         poses7d.append(np.concatenate([pose, np.asarray([gripper], dtype=np.float32)], axis=0))
 
-    poses7d_arr = np.asarray(poses7d, dtype=np.float32)
-    states = np.stack([pose7d_to_pose10d(pose7d) for pose7d in poses7d_arr], axis=0).astype(np.float32)
-    return {"poses7d": poses7d_arr, "states": states}
+    return {"poses7d": np.asarray(poses7d, dtype=np.float32)}
+
+
+def build_relative_state(
+    right: dict[str, np.ndarray],
+    left: dict[str, np.ndarray],
+    frame_idx: int,
+) -> np.ndarray:
+    arms = []
+    for arm in (right, left):
+        arms.append(
+            relative_pose7d_to_pose10d(arm["poses7d"][frame_idx - 1], arm["poses7d"][frame_idx])
+        )
+    return np.concatenate(arms, axis=0).astype(np.float32)
 
 
 def build_relative_action_chunk(
@@ -169,14 +221,16 @@ def get_episode_task(episode_dir: Path, task_override: str | None) -> str:
 
 def create_features(image_shape: tuple[int, int, int], horizon: int) -> dict[str, dict[str, Any]]:
     state_names = [
-        "right_pos_x", "right_pos_y", "right_pos_z",
-        "right_rot6d_0", "right_rot6d_1", "right_rot6d_2",
-        "right_rot6d_3", "right_rot6d_4", "right_rot6d_5",
-        "right_gripper",
-        "left_pos_x", "left_pos_y", "left_pos_z",
-        "left_rot6d_0", "left_rot6d_1", "left_rot6d_2",
-        "left_rot6d_3", "left_rot6d_4", "left_rot6d_5",
-        "left_gripper",
+        "right_prev_in_current_pos_x", "right_prev_in_current_pos_y", "right_prev_in_current_pos_z",
+        "right_prev_in_current_rot6d_0", "right_prev_in_current_rot6d_1",
+        "right_prev_in_current_rot6d_2", "right_prev_in_current_rot6d_3",
+        "right_prev_in_current_rot6d_4", "right_prev_in_current_rot6d_5",
+        "right_prev_gripper",
+        "left_prev_in_current_pos_x", "left_prev_in_current_pos_y", "left_prev_in_current_pos_z",
+        "left_prev_in_current_rot6d_0", "left_prev_in_current_rot6d_1",
+        "left_prev_in_current_rot6d_2", "left_prev_in_current_rot6d_3",
+        "left_prev_in_current_rot6d_4", "left_prev_in_current_rot6d_5",
+        "left_prev_gripper",
     ]
     return {
         "observation.state": {"dtype": "float32", "shape": (20,), "names": state_names},
@@ -238,7 +292,7 @@ def prepare_frame(
     horizon: int,
     image_size: int,
 ) -> dict[str, Any]:
-    state = np.concatenate([right["states"][frame_idx], left["states"][frame_idx]], axis=0).astype(np.float32)
+    state = build_relative_state(right, left, frame_idx)
     left_image = np.asarray(resize_with_pad(load_rgb_image(files["left_fisheye"][frame_idx]), image_size, image_size))
     right_image = np.asarray(resize_with_pad(load_rgb_image(files["right_fisheye"][frame_idx]), image_size, image_size))
     return {
@@ -263,21 +317,21 @@ def iter_prepared_frames(
 ):
     args = (files, right, left, task)
     if frame_workers == 1:
-        for frame_idx in range(written):
+        for frame_idx in range(1, written + 1):
             yield prepare_frame(*args, frame_idx, horizon, image_size)
         return
 
     executor = ThreadPoolExecutor(max_workers=frame_workers)
     pending: deque[Future[dict[str, Any]]] = deque()
-    next_frame_idx = 0
+    next_frame_idx = 1
     try:
-        while next_frame_idx < min(written, 2 * frame_workers):
+        while next_frame_idx <= min(written, 2 * frame_workers):
             pending.append(executor.submit(prepare_frame, *args, next_frame_idx, horizon, image_size))
             next_frame_idx += 1
 
         while pending:
             yield pending.popleft().result()
-            if next_frame_idx < written:
+            if next_frame_idx <= written:
                 pending.append(executor.submit(prepare_frame, *args, next_frame_idx, horizon, image_size))
                 next_frame_idx += 1
     finally:
@@ -294,14 +348,14 @@ def add_episode_to_dataset(
 ) -> dict[str, Any]:
     files = discover_episode_files(episode_dir)
     frame_count = len(files["right_pose"])
-    if frame_count <= horizon:
+    if frame_count <= horizon + 1:
         raise ValueError(f"Episode {episode_dir} has {frame_count} frames, not enough for horizon={horizon}")
 
     right = build_arm_series(files["right_pose"], files["right_gripper"])
     left = build_arm_series(files["left_pose"], files["left_gripper"])
     task = get_episode_task(episode_dir, task_override)
 
-    written = frame_count - horizon
+    written = frame_count - horizon - 1
     frames = iter_prepared_frames(files, right, left, task, written, horizon, image_size, frame_workers)
     for frame in frames:
         dataset.add_frame(frame)
