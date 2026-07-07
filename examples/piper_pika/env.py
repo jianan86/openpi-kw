@@ -35,6 +35,7 @@ class PiperPikaEnvironment(_environment.Environment):
         self._sensors = _hardware.SensorWorker(hardware)
         self._sensors.start()
         self._last_target = None
+        self._previous_snapshot = None
 
     @override
     def reset(self) -> None:
@@ -42,6 +43,7 @@ class PiperPikaEnvironment(_environment.Environment):
             self._hardware.move_home(self._home)
         snapshot = self._wait_for_snapshot()
         self._last_target = snapshot.tcp_pose.copy()
+        self._previous_snapshot = snapshot
 
     @override
     def is_episode_complete(self) -> bool:
@@ -49,10 +51,15 @@ class PiperPikaEnvironment(_environment.Environment):
 
     @override
     def get_observation(self) -> dict:
-        snapshot = self._wait_for_snapshot()
-        right_state = piper_pika.pose7_to_pose10(snapshot.tcp_pose[piper_pika.RIGHT_ARM_SLICE])
-        left_state = piper_pika.pose7_to_pose10(snapshot.tcp_pose[piper_pika.LEFT_ARM_SLICE])
-        state = np.concatenate([right_state, left_state]).astype(np.float32, copy=False)
+        previous = self._previous_snapshot
+        if previous is None:
+            previous = self._wait_for_snapshot()
+        snapshot = self._wait_for_snapshot_after(previous.timestamp, timeout=0.5)
+        if snapshot is None:
+            print("[observation] timed out waiting for next sensor frame; using previous == current", flush=True)
+            snapshot = previous
+        self._previous_snapshot = snapshot
+        state = piper_pika.build_relative_state(previous.tcp_pose, snapshot.tcp_pose)
         black = np.zeros_like(snapshot.left_rgb)
         return {
             "observation.state": state,
@@ -82,7 +89,12 @@ class PiperPikaEnvironment(_environment.Environment):
                 self._gripper_range,
             )
         if self._dry_run:
-            ee = np.concatenate([piper_pika.tcp_pose7_to_ee_pose7(limited[piper_pika.RIGHT_ARM_SLICE]), piper_pika.tcp_pose7_to_ee_pose7(limited[piper_pika.LEFT_ARM_SLICE])])
+            ee = np.concatenate(
+                [
+                    piper_pika.tcp_pose7_to_ee_pose7(limited[piper_pika.RIGHT_ARM_SLICE]),
+                    piper_pika.tcp_pose7_to_ee_pose7(limited[piper_pika.LEFT_ARM_SLICE]),
+                ]
+            )
             print(f"[dry-run control] tcp={limited.round(6).tolist()} ee={ee.round(6).tolist()}", flush=True)
         else:
             self._hardware.execute(limited)
@@ -100,3 +112,12 @@ class PiperPikaEnvironment(_environment.Environment):
                 return snapshot
             time.sleep(0.01)
         raise RuntimeError("timed out waiting for Piper/Pika sensor data")
+
+    def _wait_for_snapshot_after(self, timestamp: float, timeout: float) -> _hardware.SensorSnapshot | None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            snapshot = self._sensors.latest.get()
+            if snapshot is not None and snapshot.timestamp > timestamp:
+                return snapshot
+            time.sleep(0.01)
+        return None

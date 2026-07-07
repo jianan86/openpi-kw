@@ -53,3 +53,32 @@ follow the RDT2 `async_inference` Piper/Pika client.
 | 20D ordering and black `cam_high` | Existing OpenPI Pika dataset/config |
 
 RDT2 gRPC, asynchronous observation queues, action streaming, waterline scheduling, and chunk merge strategies are intentionally not used.
+
+## LeRobot VISTA checkpoint
+
+The VISTA action-expert checkpoint uses the LeRobot gRPC protocol, 16D quaternion
+state/actions, and left-arm-first ordering. Start its server on the GPU host:
+
+```bash
+conda activate rdt2
+cd /home/jianan/code/umi-vista/post_training/lerobot
+CUDA_VISIBLE_DEVICES=4 python -m lerobot.async_inference.policy_server \
+  --host=127.0.0.1 --port=8080 --fps=30 --inference_latency=0 --obs_queue_timeout=1
+```
+
+Run sensor collection and one prediction without enabling robot motion:
+
+```bash
+conda activate lerobot
+cd /home/kw/workspace/openpi-kw
+export PYTHONPATH=$PWD/packages/openpi-client/src:$PWD
+python -m examples.piper_pika.vista_grpc \
+  --checkpoint=/data/jianan/outputs/vista_action_expert_train/26-07-01_18-07-02_vista_action_expert_gpu4567/checkpoints/060000/pretrained_model \
+  --prediction-only --max-predictions=1
+```
+
+Motion is disabled by default. Only with an operator at the emergency stop, manually
+place both arms at the task start pose and replace `--prediction-only` with
+`--enable-motion --max-control-steps=30`. The motion path enforces 2 mm / 0.01 rad /
+1 mm per-step limits and a 2 cm total translation guard for each arm. There is no total rotation guard by default. It never moves
+to `home_pos` automatically.

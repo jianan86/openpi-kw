@@ -1025,7 +1025,11 @@ _CONFIGS = [
             freeze_patterns=["language_model"],  # UMI strategy: freeze VLM, train ViT+Expert
         ),
         data=LeRobotUMIDataConfig(
-            repo_id="local/pi-0601-dex",
+            repo_id="/data/jianan/data/lerobot_pi_0623_dex_relative_state",
+            assets=AssetsConfig(
+                assets_dir="/data/jianan/data",
+                asset_id="lerobot_pi_0623_dex_relative_state",
+            ),
             euler_input=False,  # data already uses 6D rotation
             base_config=DataConfig(
                 action_sequence_keys=(),     # action already pre-chunked to (10, 20)
@@ -1042,9 +1046,9 @@ _CONFIGS = [
             decay_steps=1_000_000,
             decay_lr=1e-5,
         ),
-        num_train_steps=30_000,
+        num_train_steps=100_000,
         batch_size=32,
-        save_interval=5_000,
+        save_interval=50_000,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

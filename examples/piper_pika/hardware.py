@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from pathlib import Path
 import threading
 import time
 
 import numpy as np
 from openpi_client import piper_pika
+
+DEVICE_GROUP_SUMMARY_PATH = Path("/home/kw/workspace/device_group/summary.json")
 
 _PIPER_FATAL_STATUS_TERMS = (
     "NO_SOLUTION",
@@ -32,6 +35,14 @@ class SensorSnapshot:
     timestamp: float
 
 
+@dataclass(frozen=True)
+class PikaDeviceBinding:
+    group_name: str
+    physical_device_id: str
+    gripper_port: str
+    fisheye_device: str
+
+
 class LatestValue:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -47,10 +58,12 @@ class LatestValue:
 
 
 class PiperRobot:
-    def __init__(self, side: str, can_name: str, *, dry_run: bool, disabled: bool) -> None:
+    def __init__(self, side: str, can_name: str, *, dry_run: bool, disabled: bool, enable_motion: bool = True, strict_status: bool = False) -> None:
         self.side = side
         self.can_name = can_name
         self.dry_run = dry_run
+        self.enable_motion = enable_motion
+        self.strict_status = strict_status
         self.robot = None
         if disabled:
             return
@@ -58,9 +71,10 @@ class PiperRobot:
 
         self.robot = C_PiperInterface(can_name=can_name)
         self.robot.ConnectPort()
-        while not self.robot.EnablePiper():
-            time.sleep(0.01)
-        self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
+        if enable_motion:
+            while not self.robot.EnablePiper():
+                time.sleep(0.01)
+            self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
 
     def read_ee_pose(self) -> np.ndarray:
         if self.robot is None:
@@ -79,6 +93,8 @@ class PiperRobot:
     def execute_pose(self, target: np.ndarray) -> None:
         if self.robot is None or self.dry_run:
             return
+        if not self.enable_motion:
+            raise RuntimeError(f"Piper {self.side} motion is disabled")
         x, y, z, roll, pitch, yaw = np.asarray(target, dtype=np.float32)[:6]
         self.robot.MotionCtrl_2(0x01, 0x00, 100, 0x00)
         self.robot.EndPoseCtrl(
@@ -94,6 +110,8 @@ class PiperRobot:
     def execute_joints(self, joints: np.ndarray) -> None:
         if self.robot is None or self.dry_run:
             return
+        if not self.enable_motion:
+            raise RuntimeError(f"Piper {self.side} motion is disabled")
         values = tuple(round(float(np.degrees(value)) * 1000.0) for value in joints)
         self.robot.MotionCtrl_2(0x01, 0x01, 100, 0x00)
         self.robot.JointCtrl(*values)
@@ -109,7 +127,7 @@ class PiperRobot:
                 snapshots.append(str(method()))
         text = json.dumps(snapshots)
         errors = [term for term in _PIPER_FATAL_STATUS_TERMS if term in text]
-        if "TARGET_POS_EXCEEDS_LIMIT" in errors:
+        if "TARGET_POS_EXCEEDS_LIMIT" in errors and not self.strict_status:
             print(
                 f"[piper-error] Piper {self.side} reported TARGET_POS_EXCEEDS_LIMIT; continuing",
                 flush=True,
@@ -117,6 +135,63 @@ class PiperRobot:
             errors = [error for error in errors if error != "TARGET_POS_EXCEEDS_LIMIT"]
         if errors:
             raise RuntimeError(f"Piper {self.side} reported fatal status: {errors}")
+
+
+def load_pika_device_bindings(summary_path: Path = DEVICE_GROUP_SUMMARY_PATH) -> dict[str, PikaDeviceBinding]:
+    try:
+        payload = json.loads(summary_path.read_text())
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"device group summary not found: {summary_path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid device group summary JSON: {summary_path}") from exc
+
+    groups = payload.get("groups")
+    if not isinstance(groups, list):
+        raise ValueError(f"device group summary must contain a groups list: {summary_path}")
+
+    by_name = {group.get("device_name"): group for group in groups if isinstance(group, dict)}
+    return {
+        "right": _parse_pika_binding(by_name, "right_gripper"),
+        "left": _parse_pika_binding(by_name, "left_gripper"),
+    }
+
+
+def _parse_pika_binding(groups: dict[str, dict], group_name: str) -> PikaDeviceBinding:
+    group = groups.get(group_name)
+    if group is None:
+        raise RuntimeError(f"device group summary missing group: {group_name}")
+    if group.get("status") != "ok":
+        raise RuntimeError(f"device group {group_name} status is not ok: {group.get('status')}")
+
+    usb_port = group.get("usb_port")
+    fisheye = group.get("fisheye")
+    if not isinstance(usb_port, dict):
+        raise ValueError(f"device group {group_name} missing usb_port object")
+    if not isinstance(fisheye, dict):
+        raise ValueError(f"device group {group_name} missing fisheye object")
+
+    gripper_port = usb_port.get("devnode")
+    fisheye_device = fisheye.get("devnode")
+    if not gripper_port:
+        raise ValueError(f"device group {group_name} missing usb_port.devnode")
+    if not fisheye_device:
+        raise ValueError(f"device group {group_name} missing fisheye.devnode")
+
+    return PikaDeviceBinding(
+        group_name=group_name,
+        physical_device_id=str(group.get("physical_device_id", "")),
+        gripper_port=str(gripper_port),
+        fisheye_device=str(fisheye_device),
+    )
+
+
+def _print_pika_binding(side: str, binding: PikaDeviceBinding) -> None:
+    print(
+        f"[device-bind] {side} group={binding.group_name} "
+        f"physical_device_id={binding.physical_device_id} "
+        f"gripper_port={binding.gripper_port} fisheye_device={binding.fisheye_device}",
+        flush=True,
+    )
 
 
 class PikaGripper:
@@ -131,15 +206,21 @@ class PikaGripper:
         *,
         dry_run: bool,
         disabled: bool,
+        enable_motion: bool = True,
     ) -> None:
         self.side = side
         self.width = width
         self.height = height
         self.dry_run = dry_run
+        self.enable_motion = enable_motion
         self.device = None
         self.fisheye = None
         if disabled:
             return
+        import cv2  # noqa: PLC0415
+
+        if not hasattr(cv2, "setLogLevel"):
+            cv2.setLogLevel = lambda *_args: None
         from pika.gripper import Gripper  # noqa: PLC0415
 
         self.device = Gripper(port)
@@ -181,43 +262,54 @@ class PikaGripper:
     def execute_width(self, width_m: float) -> None:
         if self.device is None or self.dry_run:
             return
+        if not self.enable_motion:
+            raise RuntimeError(f"Pika {self.side} motion is disabled")
         self.device.set_gripper_distance(float(np.clip(width_m * 1000.0, 0.0, 90.0)))
 
 
 class PiperPikaHardware:
-    def __init__(self, config: dict, arm_mode: str, *, dry_run: bool, no_piper: bool, no_pika: bool) -> None:
+    def __init__(self, config: dict, arm_mode: str, *, dry_run: bool, no_piper: bool, no_pika: bool, enable_motion: bool = True, strict_status: bool = False) -> None:
         self.arm_mode = arm_mode
         camera = config.get("camera", {})
         self.image_size = int(camera.get("image_size", 224))
         width = int(camera.get("width", 640))
         height = int(camera.get("height", 480))
         fps = int(camera.get("fps", 30))
+        pika_bindings = None if no_pika else load_pika_device_bindings()
 
-        self.right_arm = PiperRobot("right", config["right"]["piper_can"], dry_run=dry_run, disabled=no_piper)
+        self.right_arm = PiperRobot("right", config["right"]["piper_can"], dry_run=dry_run, disabled=no_piper, enable_motion=enable_motion, strict_status=strict_status)
+        right_binding = pika_bindings["right"] if pika_bindings is not None else None
         self.right_gripper = PikaGripper(
             "right",
-            config["right"]["gripper_port"],
-            config["right"]["fisheye_device"],
+            right_binding.gripper_port if right_binding is not None else config["right"]["gripper_port"],
+            right_binding.fisheye_device if right_binding is not None else config["right"]["fisheye_device"],
             width,
             height,
             fps,
             dry_run=dry_run,
             disabled=no_pika,
+            enable_motion=enable_motion,
         )
+        if right_binding is not None:
+            _print_pika_binding("right", right_binding)
         self.left_arm: PiperRobot | None = None
         self.left_gripper: PikaGripper | None = None
         if arm_mode == "dual":
-            self.left_arm = PiperRobot("left", config["left"]["piper_can"], dry_run=dry_run, disabled=no_piper)
+            self.left_arm = PiperRobot("left", config["left"]["piper_can"], dry_run=dry_run, disabled=no_piper, enable_motion=enable_motion, strict_status=strict_status)
+            left_binding = pika_bindings["left"] if pika_bindings is not None else None
             self.left_gripper = PikaGripper(
                 "left",
-                config["left"]["gripper_port"],
-                config["left"]["fisheye_device"],
+                left_binding.gripper_port if left_binding is not None else config["left"]["gripper_port"],
+                left_binding.fisheye_device if left_binding is not None else config["left"]["fisheye_device"],
                 width,
                 height,
                 fps,
                 dry_run=dry_run,
                 disabled=no_pika,
+                enable_motion=enable_motion,
             )
+            if left_binding is not None:
+                _print_pika_binding("left", left_binding)
 
     def close(self) -> None:
         self.right_arm.close()

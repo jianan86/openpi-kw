@@ -9,10 +9,23 @@ def test_ee_tcp_roundtrip():
     np.testing.assert_allclose(piper_pika.tcp_pose7_to_ee_pose7(tcp_pose), ee_pose, atol=1e-5)
 
 
+def test_build_relative_state_is_previous_pose_in_current_frame():
+    previous = np.asarray([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2], dtype=np.float32)
+    current = np.asarray([0.0, 0.0, 0.0, 0.0, 0.0, np.pi / 2, 0.8], dtype=np.float32)
+    state = piper_pika.build_relative_state(np.concatenate([previous, previous]), np.concatenate([current, current]))
+    expected_arm = np.asarray(
+        [0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.2],
+        dtype=np.float32,
+    )
+
+    np.testing.assert_allclose(state[:10], expected_arm, atol=1e-6)
+    np.testing.assert_allclose(state[10:], expected_arm, atol=1e-6)
+
+
 def test_relative_actions_to_absolute_tcp():
     right = np.array([0.5, 0.0, 0.2, 0.0, 0.0, 0.0, 0.04], dtype=np.float32)
     left = np.array([0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.06], dtype=np.float32)
-    state = np.concatenate([piper_pika.pose7_to_pose10(right), piper_pika.pose7_to_pose10(left)])
+    current_tcp_pose = np.concatenate([right, left])
     identity = piper_pika.matrix_to_rot6d(np.eye(3, dtype=np.float32))
     action = np.zeros((2, 20), dtype=np.float32)
     for arm_start in (0, 10):
@@ -22,7 +35,7 @@ def test_relative_actions_to_absolute_tcp():
     action[0, 10:13] = [-0.02, 0.0, 0.01]
     action[0, 19] = 0.05
 
-    result = piper_pika.relative_actions_to_absolute_tcp(action, state)
+    result = piper_pika.relative_actions_to_absolute_tcp(action, current_tcp_pose)
 
     np.testing.assert_allclose(result[0, :3], right[:3] + action[0, :3], atol=1e-6)
     np.testing.assert_allclose(result[0, 7:10], left[:3] + action[0, 10:13], atol=1e-6)

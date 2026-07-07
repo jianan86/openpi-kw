@@ -113,6 +113,30 @@ def pose10_to_matrix(pose: np.ndarray) -> np.ndarray:
     return matrix
 
 
+def relative_pose7_to_pose10(target_pose: np.ndarray, base_pose: np.ndarray) -> np.ndarray:
+    """Compute target TCP pose in base TCP coordinates as [xyz, rot6d, target_gripper]."""
+    target_pose = np.asarray(target_pose, dtype=np.float32)
+    base_pose = np.asarray(base_pose, dtype=np.float32)
+    if target_pose.shape != (SINGLE_ARM_POSE_DIM,) or base_pose.shape != (SINGLE_ARM_POSE_DIM,):
+        raise ValueError("target_pose and base_pose must both have shape (7,)")
+    relative = np.linalg.inv(pose7_to_matrix(base_pose)) @ pose7_to_matrix(target_pose)
+    return np.concatenate([relative[:3, 3], matrix_to_rot6d(relative[:3, :3]), target_pose[6:7]]).astype(
+        np.float32, copy=False
+    )
+
+
+def build_relative_state(previous_tcp_pose: np.ndarray, current_tcp_pose: np.ndarray) -> np.ndarray:
+    """Build right-then-left relative observation.state matching the Pika training data."""
+    previous_tcp_pose = np.asarray(previous_tcp_pose, dtype=np.float32)
+    current_tcp_pose = np.asarray(current_tcp_pose, dtype=np.float32)
+    if previous_tcp_pose.shape != (14,) or current_tcp_pose.shape != (14,):
+        raise ValueError("previous_tcp_pose and current_tcp_pose must both have shape (14,)")
+    arms = []
+    for arm_slice in (RIGHT_ARM_SLICE, LEFT_ARM_SLICE):
+        arms.append(relative_pose7_to_pose10(previous_tcp_pose[arm_slice], current_tcp_pose[arm_slice]))
+    return np.concatenate(arms, axis=0).astype(np.float32, copy=False)
+
+
 def ee_pose7_to_tcp_pose7(ee_pose: np.ndarray) -> np.ndarray:
     ee_pose = np.asarray(ee_pose, dtype=np.float32)
     return matrix_to_pose7(pose7_to_matrix(ee_pose) @ T_EE_TCP, float(ee_pose[6]))
@@ -123,20 +147,20 @@ def tcp_pose7_to_ee_pose7(tcp_pose: np.ndarray) -> np.ndarray:
     return matrix_to_pose7(pose7_to_matrix(tcp_pose) @ T_TCP_EE, float(tcp_pose[6]))
 
 
-def relative_actions_to_absolute_tcp(actions: np.ndarray, state: np.ndarray) -> np.ndarray:
+def relative_actions_to_absolute_tcp(actions: np.ndarray, current_tcp_pose: np.ndarray) -> np.ndarray:
     """Convert a (T, 20) relative UMI chunk into absolute (T, 14) TCP targets."""
     actions = np.asarray(actions, dtype=np.float32)
-    state = np.asarray(state, dtype=np.float32)
+    current_tcp_pose = np.asarray(current_tcp_pose, dtype=np.float32)
     if actions.ndim != 2 or actions.shape[1] != 20:
         raise ValueError(f"expected action shape (T, 20), got {actions.shape}")
-    if state.shape != (20,):
-        raise ValueError(f"expected state shape (20,), got {state.shape}")
+    if current_tcp_pose.shape != (14,):
+        raise ValueError(f"expected current_tcp_pose shape (14,), got {current_tcp_pose.shape}")
 
     arm_chunks = []
     identity_rot6d = matrix_to_rot6d(np.eye(3, dtype=np.float32))
-    for arm_index in range(2):
+    for arm_index, arm_slice in enumerate((RIGHT_ARM_SLICE, LEFT_ARM_SLICE)):
         start = arm_index * SINGLE_ARM_MODEL_DIM
-        base = pose10_to_matrix(state[start : start + SINGLE_ARM_MODEL_DIM])
+        base = pose7_to_matrix(current_tcp_pose[arm_slice])
         relative = actions[:, start : start + SINGLE_ARM_MODEL_DIM]
         arm_targets = []
         for row in relative:
@@ -210,6 +234,7 @@ class RelativeActionPolicy(_base_policy.BasePolicy):
         state = np.asarray(obs["observation.state"], dtype=np.float32).copy()
         ee_pose = np.asarray(obs["_debug.ee_pose"], dtype=np.float32)
         tcp_pose = np.asarray(obs["_debug.tcp_pose"], dtype=np.float32)
+        print(f"[request] relative_state={state.round(6).tolist()}", flush=True)
         print(f"[request] ee_pose={ee_pose.round(6).tolist()}", flush=True)
         print(f"[request] tcp_pose={tcp_pose.round(6).tolist()}", flush=True)
         request_obs = {key: value for key, value in obs.items() if not key.startswith("_debug.")}
@@ -217,7 +242,7 @@ class RelativeActionPolicy(_base_policy.BasePolicy):
         actions = np.asarray(result["actions"], dtype=np.float32)
         if self._action_horizon is not None and actions.shape[0] != self._action_horizon:
             raise ValueError(f"expected action horizon {self._action_horizon}, got {actions.shape}")
-        absolute_tcp = relative_actions_to_absolute_tcp(actions, state)
+        absolute_tcp = relative_actions_to_absolute_tcp(actions, tcp_pose)
         absolute_tcp, closure_offsets = accelerate_gripper_closure(absolute_tcp)
         if any(closure_offsets):
             print(
